@@ -60,3 +60,12 @@ Contributions are welcome! Please open an issue or submit a pull request with an
 ## Acknowledgements
 
 Special thanks to the developers of the libraries used in this project, including Tkinter, Paramiko, SCP, ttkthemes, Pillow, and others.
+
+### Downloading an Existing Remote Archive
+
+1. Go to `File > Download Remote File` and enter the same SSH credentials used for the SSH log workflow.
+2. Select one of the ten newest `.tar` archives in the remote `/tmp` directory.
+3. Choose a new local destination. Existing files are never overwritten.
+4. The archive is downloaded directly with SFTP, with transferred bytes, percentage, speed, and ETA shown during the transfer. The completed download is size-verified and its SHA256 digest is displayed.
+
+This workflow never runs `phziplogs`, splits archives, or changes remote files. Cancelling or a failed transfer removes the local partial file.
