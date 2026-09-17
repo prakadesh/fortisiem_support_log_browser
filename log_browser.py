@@ -50,7 +50,7 @@ if installed_any:
 from recursive_extractor import RecursiveExtractor
 from log_module import get_logger_instance, DummyLogger
 from updater import AutoUpdater
-from ssh_client import SSHClient
+from ssh_client import SSHClient, RemoteSFTPClient, SFTPDownloadCancelled
 import logging
 import tkinter as tk
 from tkinter import ttk, messagebox, font, PhotoImage, scrolledtext, filedialog
@@ -1273,6 +1273,7 @@ class LogViewerApp:
         file_menu.add_command(label="Open tar", command=self.open_file)
         file_menu.add_command(label="Open Existing Directory", command=self.open_existing)
         file_menu.add_command(label="Open via SSH", command=self.fetch_ssh_logs)
+        file_menu.add_command(label="Download Remote File", command=self.download_remote_file)
         file_menu.add_separator()
         file_menu.add_command(label="Close current log", command=lambda: self.cleanup(), state='disabled')
         file_menu.add_separator()
@@ -2140,6 +2141,151 @@ class LogViewerApp:
         top_level_window.grab_set()
         top_level_window.focus_set()
         self.root.wait_window(top_level_window)
+
+    def download_remote_file(self):
+        """Authenticate, then list existing /tmp TAR files without running phziplogs."""
+        current_theme = sv_ttk.get_theme()
+        window = tk.Toplevel(self.root)
+        form = SSHCredentialsForm(
+            window, callback=self.handle_remote_download_credentials,
+            initial_credentials=self.config.get("ssh_credentials", {}), theme=current_theme,
+        )
+        form.pack()
+        window.transient(self.root)
+        self.set_initial_window_position(window)
+        window.grab_set()
+        window.focus_set()
+        self.root.wait_window(window)
+
+    def handle_remote_download_credentials(self, credentials):
+        self.config['ssh_credentials'] = credentials
+        ConfigManager.save_config(self.config)
+        self._remote_credentials = credentials
+        self._show_remote_listing_progress()
+        threading.Thread(target=self._load_remote_tar_files, args=(credentials,), daemon=True).start()
+
+    def _show_remote_listing_progress(self):
+        self.remote_progress_window = tk.Toplevel(self.root)
+        self.remote_progress_window.title("Download Remote File")
+        ttk.Label(self.remote_progress_window, text="Listing TAR files in /tmp…").pack(padx=28, pady=24)
+        self.remote_progress_window.transient(self.root)
+        self.remote_progress_window.grab_set()
+        self.set_initial_window_position(self.remote_progress_window)
+
+    def _load_remote_tar_files(self, credentials):
+        try:
+            files = RemoteSFTPClient(**{key: credentials.get(key) for key in ('hostname', 'username', 'password')}, key_filename=credentials.get('keyfile'), logger=self.logger).list_tar_files()
+            self.root.after(0, lambda: self._show_remote_file_dialog(files))
+        except Exception as error:
+            self.logger.error(f"Unable to list remote TAR files: {error}")
+            self.root.after(0, lambda: self._remote_listing_error(error))
+
+    def _remote_listing_error(self, error):
+        self._destroy_remote_progress()
+        messagebox.showerror("Download Remote File", f"Unable to list /tmp TAR files:\n{error}", parent=self.root)
+
+    def _destroy_remote_progress(self):
+        try:
+            if self.remote_progress_window.winfo_exists():
+                self.remote_progress_window.destroy()
+        except (AttributeError, tk.TclError):
+            pass
+
+    @staticmethod
+    def _format_remote_size(size):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+            size /= 1024
+
+    def _show_remote_file_dialog(self, files):
+        self._destroy_remote_progress()
+        if not files:
+            messagebox.showinfo("Download Remote File", "No TAR files were found in /tmp.", parent=self.root)
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Download Remote File")
+        ttk.Label(dialog, text="Select one TAR archive from /tmp:").pack(anchor="w", padx=12, pady=(12, 4))
+        tree = ttk.Treeview(dialog, columns=("size", "modified"), show="tree headings", selectmode="browse", height=min(len(files), 10))
+        tree.heading("#0", text="Name")
+        tree.heading("size", text="Size")
+        tree.heading("modified", text="Modified")
+        tree.column("#0", width=260)
+        tree.column("size", width=100, anchor="e")
+        tree.column("modified", width=165)
+        for item in files:
+            tree.insert("", "end", iid=item["path"], text=item["name"], values=(self._format_remote_size(item["size"]), datetime.fromtimestamp(item["mtime"]).strftime("%Y-%m-%d %H:%M:%S")))
+        tree.pack(fill="both", expand=True, padx=12, pady=4)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(pady=(4, 12))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Download Selected", command=lambda: self._choose_remote_destination(dialog, tree, files)).pack(side="right", padx=4)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        self.set_initial_window_position(dialog)
+
+    def _choose_remote_destination(self, dialog, tree, files):
+        selected = tree.selection()
+        if len(selected) != 1:
+            messagebox.showwarning("Download Remote File", "Select one archive to download.", parent=dialog)
+            return
+        remote_file = next(item for item in files if item["path"] == selected[0])
+        local_path = filedialog.asksaveasfilename(parent=dialog, title="Save remote archive as", initialfile=remote_file["name"], defaultextension=".tar", filetypes=[("TAR archives", "*.tar"), ("All files", "*.*")])
+        if not local_path:
+            return
+        if os.path.exists(local_path):
+            messagebox.showerror("Download Remote File", "The destination already exists. Choose a different file name.", parent=dialog)
+            return
+        dialog.destroy()
+        self._start_remote_download(remote_file, local_path)
+
+    def _start_remote_download(self, remote_file, local_path):
+        self.remote_cancel_event = threading.Event()
+        window = self.remote_download_window = tk.Toplevel(self.root)
+        window.title("Downloading Remote File")
+        self.remote_status = ttk.Label(window, text=f"Downloading {remote_file['name']}")
+        self.remote_status.pack(padx=20, pady=(16, 6))
+        self.remote_bar = ttk.Progressbar(window, length=380, mode="determinate", maximum=remote_file["size"])
+        self.remote_bar.pack(padx=20, pady=6)
+        self.remote_details = ttk.Label(window, text="0 B / 0 B")
+        self.remote_details.pack(padx=20, pady=6)
+        ttk.Button(window, text="Cancel", command=self.remote_cancel_event.set).pack(pady=(4, 16))
+        window.protocol("WM_DELETE_WINDOW", self.remote_cancel_event.set)
+        window.transient(self.root)
+        window.grab_set()
+        self.set_initial_window_position(window)
+        threading.Thread(target=self._download_remote_file_worker, args=(remote_file, local_path), daemon=True).start()
+
+    def _download_remote_file_worker(self, remote_file, local_path):
+        def progress(transferred, total, speed):
+            self.root.after(0, lambda: self._update_remote_download_progress(transferred, total, speed))
+        try:
+            client = RemoteSFTPClient(self._remote_credentials['hostname'], self._remote_credentials['username'], password=self._remote_credentials.get('password'), key_filename=self._remote_credentials.get('keyfile'), logger=self.logger)
+            result = client.download_remote_file_sftp(remote_file, local_path, progress, self.remote_cancel_event)
+            self.root.after(0, lambda: self._finish_remote_download(result, None))
+        except Exception as error:
+            self.root.after(0, lambda: self._finish_remote_download(None, error))
+
+    def _update_remote_download_progress(self, transferred, total, speed):
+        try:
+            self.remote_bar["value"] = transferred
+            eta = (total - transferred) / speed if speed else 0
+            self.remote_details.config(text=f"{self._format_remote_size(transferred)} / {self._format_remote_size(total)} ({transferred / total * 100:.0f}%)  •  {self._format_remote_size(speed)}/s  •  ETA {int(eta)}s")
+        except tk.TclError:
+            pass
+
+    def _finish_remote_download(self, result, error):
+        try:
+            self.remote_download_window.destroy()
+        except tk.TclError:
+            pass
+        if isinstance(error, SFTPDownloadCancelled):
+            messagebox.showinfo("Download Remote File", "Download cancelled. Any partial file was removed.", parent=self.root)
+        elif error:
+            self.logger.error(f"Remote download failed: {error}")
+            messagebox.showerror("Download Remote File", f"Download failed: {error}", parent=self.root)
+        else:
+            messagebox.showinfo("Download complete", f"Saved {result['path']}\nSize verified: {self._format_remote_size(result['size'])}\nSHA256: {result['sha256']}", parent=self.root)
 
     def on_ssh_complete(self):
         if os.path.exists(self.download_path):

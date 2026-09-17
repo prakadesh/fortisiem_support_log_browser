@@ -440,3 +440,96 @@ class SSHClient(tk.Frame):
 class DummyLogger:
     def __getattr__(self, name):
         return lambda *args, **kwargs: None
+
+class SFTPDownloadCancelled(Exception):
+    """Raised when a direct SFTP download is cancelled by the user."""
+
+
+class RemoteSFTPClient:
+    """A short-lived SFTP client for downloading existing support archives."""
+
+    def __init__(self, hostname, username, password=None, key_filename=None, logger=None):
+        self.hostname = hostname
+        self.username = username
+        self.password = password
+        self.key_filename = os.path.normpath(key_filename) if key_filename else None
+        self.logger = logger if logger else DummyLogger()
+        self.client = None
+        self.sftp = None
+
+    def connect(self):
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        pkey = paramiko.RSAKey.from_private_key_file(self.key_filename) if self.key_filename else None
+        self.client.connect(
+            self.hostname, username=self.username, password=self.password, pkey=pkey,
+            look_for_keys=False, allow_agent=False, compress=True, timeout=10,
+            banner_timeout=200,
+        )
+        self.sftp = self.client.open_sftp()
+
+    def list_tar_files(self, directory="/tmp", limit=10):
+        """Return archive metadata sorted by newest modification time first."""
+        try:
+            self.connect()
+            files = []
+            for entry in self.sftp.listdir_attr(directory):
+                if entry.filename.lower().endswith(".tar"):
+                    files.append({
+                        "name": entry.filename,
+                        "path": f"{directory.rstrip('/')}/{entry.filename}",
+                        "size": entry.st_size,
+                        "mtime": entry.st_mtime,
+                    })
+            return sorted(files, key=lambda item: item["mtime"], reverse=True)[:limit]
+        finally:
+            self.close()
+
+    def download_remote_file_sftp(self, remote_file, local_path, progress_callback=None, cancel_event=None):
+        """Download one listed file, verify its size, and return its SHA256 digest."""
+        remote_path = remote_file["path"]
+        expected_size = remote_file["size"]
+        try:
+            self.connect()
+            # Detect a file replaced or removed since it was displayed to the user.
+            current_size = self.sftp.stat(remote_path).st_size
+            if current_size != expected_size:
+                raise OSError("The remote file changed after it was selected.")
+            started = time.monotonic()
+
+            def report(transferred, total):
+                if cancel_event and cancel_event.is_set():
+                    raise SFTPDownloadCancelled("Download cancelled by user.")
+                if progress_callback:
+                    elapsed = max(time.monotonic() - started, 0.001)
+                    progress_callback(transferred, total, transferred / elapsed)
+
+            self.sftp.get(remote_path, local_path, callback=report)
+            if cancel_event and cancel_event.is_set():
+                raise SFTPDownloadCancelled("Download cancelled by user.")
+            local_size = os.path.getsize(local_path)
+            if local_size != expected_size:
+                raise OSError(f"Downloaded size mismatch (expected {expected_size}, got {local_size}).")
+            return {"path": local_path, "size": local_size, "sha256": self.calculate_sha256(local_path)}
+        except Exception:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            raise
+        finally:
+            self.close()
+
+    @staticmethod
+    def calculate_sha256(file_path):
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as file_handle:
+            for block in iter(lambda: file_handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def close(self):
+        if self.sftp:
+            self.sftp.close()
+            self.sftp = None
+        if self.client:
+            self.client.close()
+            self.client = None
